@@ -13,9 +13,9 @@ login()
   
 
 run scanner : 
-    !python -m dataset.build_vocab_sharded \
-    --shard-start "From Shard" \
-    --shard-end "To Shard" \
+!python -m dataset.build_vocab_sharded \
+    --shard-start "from shard" \
+    --shard-end "to shard" \
     --scan-only \
     --max-items 18000000 \
     --max-categories 100000 \
@@ -23,8 +23,3 @@ run scanner :
     --workers 4 \
     --output-dir /content/drive/MyDrive/TRM-UI/vocab/vocab_18m_sharded \
     --resume-dir /content/drive/MyDrive/TRM-UI/vocab/resume_sharded
-
-
-uploading to github : 
-git add .
-git push origin main`
