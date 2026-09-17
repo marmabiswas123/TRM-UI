@@ -394,6 +394,8 @@ def scan_all_shards(
     chunk_samples: int,
     workers: int,
     max_counter_entries: int,
+    shard_start: int = 0,
+    shard_end: int | None = None,
 ) -> Tuple[List[str], List[str], int]:
     """
     Scan all physical shards.
@@ -422,8 +424,21 @@ def scan_all_shards(
     print(f"Physical shards:     {num_shards}")
     print(f"Max item IDs:        {max_items:,}")
     print(f"Max category IDs:    {max_categories:,}")
+    if shard_end is None:
+        shard_end = num_shards - 1
+
+    if not (0 <= shard_start <= shard_end < num_shards):
+        raise RuntimeError(
+            f"Invalid shard range {shard_start}-{shard_end}; "
+            f"valid range is 0-{num_shards - 1}."
+        )
+
+    selected_shards = list(range(shard_start, shard_end + 1))
+
     print(f"Chunk size:          {chunk_samples:,} samples")
     print(f"Workers:             {workers}")
+    print(f"Shard range:         {shard_start:03d}-{shard_end:03d} "
+          f"({len(selected_shards)} shards)")
     print(f"Resume directory:    {resume_root}")
     print()
 
@@ -484,21 +499,25 @@ def scan_all_shards(
     # Also trust per-shard completion markers. This makes the builder robust
     # if Colab died after writing a shard marker but before updating global
     # checkpoint.json.
-    for shard_index in range(num_shards):
+    for shard_index in selected_shards:
         marker = resume_root / f"shard_{shard_index:06d}" / "complete.json"
         if marker.exists():
             completed.add(shard_index)
 
-    completed_list = sorted(completed)
+    selected_completed = sorted(
+        shard_index for shard_index in selected_shards
+        if shard_index in completed
+    )
 
-    if completed_list:
+    if selected_completed:
         print(
-            f"Already completed: {len(completed_list)}/{num_shards} shards"
+            f"Already completed in selected range: "
+            f"{len(selected_completed)}/{len(selected_shards)} shards"
         )
 
     remaining = [
         shard_index
-        for shard_index in range(num_shards)
+        for shard_index in selected_shards
         if shard_index not in completed
     ]
 
@@ -532,9 +551,12 @@ def scan_all_shards(
                 checkpoint["completed_shards"] = completed_list
                 atomic_json_write(checkpoint_path, checkpoint)
 
+                selected_done = sum(
+                    1 for x in selected_shards if x in completed
+                )
                 print(
                     f"[CHECKPOINT] completed "
-                    f"{len(completed_list)}/{num_shards} shards "
+                    f"{selected_done}/{len(selected_shards)} selected shards "
                     f"(last={shard_index})",
                     flush=True,
                 )
@@ -545,11 +567,13 @@ def scan_all_shards(
     category_chunks: List[str] = []
     total_samples = 0
 
-    for shard_index in range(num_shards):
+    # In distributed --scan-only mode, collect only the selected range.
+    # In normal full-scan mode, selected_shards is 0..num_shards-1.
+    for shard_index in selected_shards:
         marker = resume_root / f"shard_{shard_index:06d}" / "complete.json"
         if not marker.exists():
             raise RuntimeError(
-                f"Missing completion marker for shard {shard_index}."
+                f"Missing completion marker for selected shard {shard_index}."
             )
 
         state = load_json(marker)
@@ -564,7 +588,7 @@ def scan_all_shards(
             category_chunks.append(str(shard_dir / name))
 
     checkpoint["status"] = "scan_complete"
-    checkpoint["completed_shards"] = list(range(num_shards))
+    checkpoint["completed_shards"] = sorted(completed)
     checkpoint["item_chunks"] = item_chunks
     checkpoint["category_chunks"] = category_chunks
     checkpoint["total_samples"] = total_samples
@@ -751,16 +775,86 @@ def build_vocab(args: argparse.Namespace) -> None:
             else:
                 child.unlink()
 
-    item_chunks, category_chunks, total_samples = scan_all_shards(
-        split=args.split,
-        resume_root=resume_root,
-        checkpoint_path=checkpoint_path,
-        max_items=args.max_items,
-        max_categories=args.max_categories,
-        chunk_samples=args.chunk_samples,
-        workers=args.workers,
-        max_counter_entries=args.max_counter_entries,
-    )
+    if args.merge_only:
+        # Merge-only mode is deliberately strict: after collecting shard
+        # directories from multiple runtimes/accounts, we must never silently
+        # rescan a missing shard.
+        from datasets import load_dataset
+
+        probe = load_dataset(
+            DATASET_NAME,
+            split=args.split,
+            streaming=True,
+        )
+        num_shards = int(probe.num_shards)
+
+        missing = []
+        item_chunks = []
+        category_chunks = []
+        total_samples = 0
+
+        for shard_index in range(num_shards):
+            shard_dir = resume_root / f"shard_{shard_index:06d}"
+            marker = shard_dir / "complete.json"
+            if not marker.exists():
+                missing.append(shard_index)
+                continue
+
+            state = load_json(marker)
+            total_samples += int(state.get("samples", 0))
+            item_chunks.extend(str(shard_dir / name)
+                               for name in state.get("item_chunks", []))
+            category_chunks.extend(str(shard_dir / name)
+                                   for name in state.get("category_chunks", []))
+
+        if missing:
+            preview = ", ".join(f"{x:03d}" for x in missing[:20])
+            suffix = " ..." if len(missing) > 20 else ""
+            raise RuntimeError(
+                f"Merge-only mode found {len(missing)} missing shard(s): "
+                f"{preview}{suffix}. No vocabulary was generated."
+            )
+
+        print("=" * 72)
+        print("MERGE-ONLY MODE")
+        print("=" * 72)
+        print(f"All {num_shards} shard completion markers found.")
+        print(f"Samples represented: {total_samples:,}")
+        print(f"Item chunks: {len(item_chunks):,}")
+        print(f"Category chunks: {len(category_chunks):,}")
+        print()
+
+    else:
+        item_chunks, category_chunks, total_samples = scan_all_shards(
+            split=args.split,
+            resume_root=resume_root,
+            checkpoint_path=checkpoint_path,
+            max_items=args.max_items,
+            max_categories=args.max_categories,
+            chunk_samples=args.chunk_samples,
+            workers=args.workers,
+            max_counter_entries=args.max_counter_entries,
+            shard_start=args.shard_start,
+            shard_end=args.shard_end,
+        )
+
+        if args.scan_only:
+            print()
+            print("SCAN-ONLY COMPLETE")
+            print(f"Scanned shards: {args.shard_start:03d}-"
+                  f"{args.shard_end if args.shard_end is not None else 'LAST'}")
+            print("Final vocabulary merge was intentionally skipped.")
+            return
+
+        # A partial shard range must never accidentally produce a partial
+        # vocabulary. Final vocabulary construction is only valid after all
+        # physical shards are available.
+        if args.shard_start != 0 or args.shard_end is not None:
+            raise RuntimeError(
+                "Final vocabulary construction requires the full shard range "
+                "0..160. Use --scan-only for distributed shard scanning, "
+                "then use --merge-only after gathering all shard directories."
+            )
 
     # Final selection is deterministic and exact.
     ranked_items = select_top_k(
@@ -901,6 +995,32 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--shard-start",
+        type=int,
+        default=0,
+        help="First physical shard to scan (inclusive).",
+    )
+
+    parser.add_argument(
+        "--shard-end",
+        type=int,
+        default=None,
+        help="Last physical shard to scan (inclusive). Defaults to the last shard.",
+    )
+
+    parser.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="Scan only the selected shard range and do not build the final vocabulary.",
+    )
+
+    parser.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Do not scan. Require all 161 shard completion markers, then build the final vocabulary.",
+    )
+
+    parser.add_argument(
         "--max-counter-entries",
         type=int,
         default=DEFAULT_MAX_COUNTER_ENTRIES,
@@ -924,6 +1044,15 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.scan_only and args.merge_only:
+        parser.error("--scan-only and --merge-only cannot be used together")
+
+    if args.shard_start < 0:
+        parser.error("--shard-start must be >= 0")
+
+    if args.shard_end is not None and args.shard_end < args.shard_start:
+        parser.error("--shard-end must be >= --shard-start")
 
     if args.max_items <= 0:
         parser.error("--max-items must be positive")
