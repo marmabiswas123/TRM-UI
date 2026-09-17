@@ -1,0 +1,30 @@
+move to working directory : 
+%cd drive/MyDrive/TRM-UI
+  
+
+install dependencies : 
+!pip install -r requirements.txt
+
+
+huggingface login : 
+from huggingface-hub import login
+login()
+
+  
+
+run scanner : 
+    !python -m dataset.build_vocab_sharded \
+    --shard-start "From Shard" \
+    --shard-end "To Shard" \
+    --scan-only \
+    --max-items 18000000 \
+    --max-categories 100000 \
+    --chunk-samples 10000 \
+    --workers 4 \
+    --output-dir /content/drive/MyDrive/TRM-UI/vocab/vocab_18m_sharded \
+    --resume-dir /content/drive/MyDrive/TRM-UI/vocab/resume_sharded
+
+
+uploading to github : 
+git add .
+git push origin main`
