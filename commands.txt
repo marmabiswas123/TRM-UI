@@ -7,7 +7,7 @@ install dependencies :
 
 
 huggingface login : 
-from huggingface-hub import login
+from huggingface_hub import login
 login()
 
   
