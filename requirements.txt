@@ -1,0 +1,31 @@
+# PyTorch
+torch
+torchvision
+torchaudio
+
+# Samsung TRM core
+einops
+tqdm
+coolname
+
+# Configuration
+omegaconf
+hydra-core
+pydantic
+pydantic-core
+argdantic
+# Experiment tracking / Hugging Face
+wandb
+huggingface-hub
+
+# Build / compilation
+packaging
+ninja
+wheel
+setuptools
+setuptools-scm
+
+# Numerical / JIT
+numba
+triton
+dataset
