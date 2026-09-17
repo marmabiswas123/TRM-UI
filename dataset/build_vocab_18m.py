@@ -217,7 +217,6 @@ def _scan_split_resumable(
                     "max_items": 18_000_000,
                     "max_categories": 100_000,
                     "history_length": history_length,
-                    "chunk_size": 2_000_000,
                 },
                 "split": split,
                 "processed_samples": processed,
@@ -307,13 +306,15 @@ def build_vocab(
     resume_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = resume_dir / "checkpoint.json"
 
+    # These parameters define the meaning of the vocabulary scan and must
+    # remain unchanged when resuming. chunk_size is deliberately excluded:
+    # it only controls when accumulated occurrences are spilled to disk.
     config = {
         "version": 2,
         "splits": splits,
         "max_items": max_items,
         "max_categories": max_categories,
         "history_length": history_length,
-        "chunk_size": chunk_size,
     }
 
     checkpoint = None
@@ -367,6 +368,8 @@ def build_vocab(
     print(f"Chunk size:              {chunk_size:,} occurrences")
     print(f"Output:                  {output_path}")
     print()
+    print("Each completed chunk is written to disk and checkpointed immediately.")
+    print("Chunk size is approximately 200,000 occurrences by default.")
     print("Progress is checkpointed continuously.")
     print("Restarting this command resumes from the last committed sample.")
     print()
@@ -548,8 +551,8 @@ def main() -> None:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=2_000_000,
-        help="Approximate occurrence count per durable checkpoint chunk.",
+        default=200_000,
+        help="Approximate occurrence count per durable checkpoint chunk. Each completed chunk is immediately written and checkpointed.",
     )
     parser.add_argument(
         "--output-dir",
