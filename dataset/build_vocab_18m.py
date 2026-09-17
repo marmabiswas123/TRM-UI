@@ -154,70 +154,88 @@ def _scan_split_resumable(
     item_chunks: list[str],
     category_chunks: list[str],
     next_chunk_id: int,
+    config: dict,
 ) -> tuple[int, list[str], list[str], int]:
     """
-    Scan one split.
+    Scan one split with sample-based durable chunks.
 
-    Progress is committed only after:
-      1. the completed chunk(s) have been fsynced/closed, and
-      2. the checkpoint has been atomically replaced.
+    A chunk contains exactly up to `chunk_size` DATASET SAMPLES (except the
+    final partial chunk), not a target number of item/category occurrences.
 
-    Chunks end on sample boundaries, so resume never starts in the middle of
-    a sample.
+    Resume semantics:
+      - `start_sample` is the first sample that has NOT been committed.
+      - Previously committed samples are skipped only by dataset iteration;
+        they are never counted again.
+      - Every completed chunk is written once and checkpointed immediately.
+      - A checkpoint records the next sample index to process.
     """
     dataset = get_taobao_dataset(
         split=split,
         history_length=history_length,
     )
 
-    items_buffer: list[int] = []
-    categories_buffer: list[int] = []
     sample_index = 0
     processed = start_sample
 
-    # Skip exactly the samples already committed in the checkpoint.
-    for sample in dataset:
-        if sample_index < start_sample:
+    # Resume by advancing the dataset iterator to the first uncommitted sample.
+    # This does NOT rebuild buffers or recount the skipped samples.
+    if start_sample:
+        print(
+            f"[RESUME] {split}: advancing to sample {start_sample:,} "
+            "without recounting committed samples..."
+        )
+        for _sample in dataset:
+            if sample_index >= start_sample:
+                break
             sample_index += 1
-            continue
+            if sample_index % 100_000 == 0:
+                print(
+                    f"  [RESUME] {split}: positioned at "
+                    f"{sample_index:,}/{start_sample:,} samples"
+                )
+        else:
+            # Dataset ended before the checkpoint position.
+            if sample_index < start_sample:
+                raise RuntimeError(
+                    f"Checkpoint says {start_sample:,} samples were committed, "
+                    f"but dataset contains only {sample_index:,} samples."
+                )
 
+    items_buffer: list[int] = []
+    categories_buffer: list[int] = []
+    samples_in_chunk = 0
+
+    for sample in dataset:
         items, categories = _sample_ids(sample)
         items_buffer.extend(items)
         categories_buffer.extend(categories)
+
         sample_index += 1
         processed += 1
+        samples_in_chunk += 1
 
-        # Flush at sample boundaries. This makes the checkpoint exact.
-        if len(items_buffer) >= chunk_size:
+        # CHUNK SIZE IS IN SAMPLES, not occurrences.
+        if samples_in_chunk >= chunk_size:
             item_path = resume_dir / f"items_{next_chunk_id:08d}.bin"
             category_path = resume_dir / f"categories_{next_chunk_id:08d}.bin"
 
             _write_sorted_counts(items_buffer, item_path)
             _write_sorted_counts(categories_buffer, category_path)
 
-            # Ensure chunk files are physically flushed before checkpointing.
-            with item_path.open("ab") as f:
-                f.flush()
-            with category_path.open("ab") as f:
-                f.flush()
-
             item_chunks.append(item_path.name)
             category_chunks.append(category_path.name)
             next_chunk_id += 1
 
+            # Clear only after the files have been successfully written.
             items_buffer.clear()
             categories_buffer.clear()
+            samples_in_chunk = 0
 
+            # IMPORTANT: processed is the first sample NOT yet processed.
             checkpoint = {
                 "version": 2,
                 "status": "scanning",
-                "config": {
-                    "version": 2,
-                    "splits": [split],
-                    "max_items": 18_000_000,
-                    "max_categories": 100_000,
-                    "history_length": history_length,
-                },
+                "config": config,
                 "split": split,
                 "processed_samples": processed,
                 "item_chunks": item_chunks,
@@ -226,24 +244,19 @@ def _scan_split_resumable(
             }
             _atomic_json_write(resume_dir / "checkpoint.json", checkpoint)
 
-            if len(item_chunks) % 10 == 0:
-                print(
-                    f"  {split}: checkpoint at {processed:,} samples | "
-                    f"{len(item_chunks):,} frequency chunks"
-                )
+            print(
+                f"  [CHUNK] {split}: saved chunk "
+                f"{next_chunk_id - 1:08d} | "
+                f"{processed:,} samples committed"
+            )
 
-    # Flush the final partial chunk, also at a sample boundary.
-    if items_buffer:
+    # Save the final partial chunk, if any.
+    if samples_in_chunk:
         item_path = resume_dir / f"items_{next_chunk_id:08d}.bin"
         category_path = resume_dir / f"categories_{next_chunk_id:08d}.bin"
 
         _write_sorted_counts(items_buffer, item_path)
         _write_sorted_counts(categories_buffer, category_path)
-
-        with item_path.open("ab") as f:
-            f.flush()
-        with category_path.open("ab") as f:
-            f.flush()
 
         item_chunks.append(item_path.name)
         category_chunks.append(category_path.name)
@@ -252,6 +265,7 @@ def _scan_split_resumable(
     checkpoint = {
         "version": 2,
         "status": "split_complete",
+        "config": config,
         "split": split,
         "processed_samples": processed,
         "item_chunks": item_chunks,
@@ -411,6 +425,7 @@ def build_vocab(
                 item_chunks=item_chunks,
                 category_chunks=category_chunks,
                 next_chunk_id=next_chunk_id,
+                config=config,
             )
         )
 
