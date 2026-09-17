@@ -323,14 +323,24 @@ def build_vocab(
             checkpoint = json.load(f)
 
         old_config = checkpoint.get("config")
-        if old_config is not None and old_config != config:
-            raise RuntimeError(
-                "Existing resume checkpoint was created with different "
-                "configuration.\n"
-                f"Existing: {old_config}\n"
-                f"Current:  {config}\n"
-                "Use --reset only if you intentionally want to restart."
-            )
+        if old_config is not None:
+            # chunk_size is intentionally runtime-only. Older checkpoints
+            # contain it, so remove it before comparing immutable settings.
+            old_config_for_compare = dict(old_config)
+            old_config_for_compare.pop("chunk_size", None)
+
+            if old_config_for_compare != config:
+                raise RuntimeError(
+                    "Existing resume checkpoint was created with different "
+                    "configuration.\n"
+                    f"Existing: {old_config_for_compare}\n"
+                    f"Current:  {config}\n"
+                    "Use --reset only if you intentionally want to restart."
+                )
+
+            # Normalize the checkpoint in memory so future writes use the
+            # current configuration format without chunk_size.
+            checkpoint["config"] = config
 
         # Older checkpoints without config are not safe to reuse.
         if old_config is None:
